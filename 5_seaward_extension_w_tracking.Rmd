@@ -1,0 +1,289 @@
+---
+author: "Bethany Clark"
+date: '2023-05-05'
+output: html_document
+---
+
+<!--- This is an HTML comment in RMarkdown. You can use these comments to make notes that won't get read when running the code -->
+
+<!--- {-} curly brackets hash means subsections won't get numbered -->
+
+## Seaward Extensions: Multiple colonies
+
+This analysis was performed in **`r sessionInfo()$R.version$version.string`**\
+
+This document was last updated on **`r Sys.Date()`** 
+<br><br>
+
+**What does this section cover:**
+
+-   Create a seaward extension raster for multiple colonies of breeding seabirds of the same species (excluding colonies represented by tracking data)
+
+**Input data:**
+-   csv file containing:
+  -   Seabird breeding colony location (latitude and longitude)
+  -   Abundance estimate for seabird breeding colony 
+
+-   Estimate of appropriate foraging range (max distance travelled from the colony)
+
+**Outputs:**
+
+- A raster for each species that can be combined in the next step
+
+```{r swe3-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+## we also specify in the options here to set the overall working directory
+## back to the root directory of the R Project we are working in. We do this
+## because by default , the working directory for R code chunks is the directory 
+## that contains the Rmd document. We don't want this option given our file
+## set up prefers the option of having the working directory specified as that
+## where the R Project is.
+knitr::opts_knit$set(root.dir = "..")
+
+wd <- getwd()
+```
+
+## **Load required R packages:**
+
+If the packages fail to load, you will need to install them.
+If the install script fails, try downloading a new version of R here: https://cran.rstudio.com/index.html 
+If that fails try installing Rtools.
+
+```{r swe3-load-packages, include = TRUE}
+#If needed remove the "#" and run the code below to install the packages. This only needs to be done once.
+#install.packages("sf")
+#install.packages("terra")
+#install.packages("rnaturalearth")
+#install.packages("smoothr")
+#install.packages("tidyverse")
+#install.packages("stringr")
+
+#Load the libraries. This needs to done every time R is restarted.
+library(sf)     #for handling spatial points and polygons
+library(terra)  #for handling rasters
+library(smoothr)#for filling holes in polygons
+library(rnaturalearth)# rnaturalearth package for geographic basemaps
+library(tidyverse) #for plots and data wrangling
+library(stringr) #for text edits
+library(RColorBrewer) #for plot colours
+
+#If it shows, the following warning can be ignored:
+#The legacy packages maptools, rgdal, and rgeos, underpinning this package
+#will retire shortly. Please refer to R-spatial evolution reports on
+#https://r-spatial.org/r/2023/05/15/evolution4.html for details.
+#This package is now running under evolution status 0 
+#Support for Spatial objects (`sp`) will be deprecated in {rnaturalearth} and will be removed in a future release of the package. Please use `sf` objects with #{rnaturalearth}. For example: `ne_download(returnclass = 'sf')`
+
+```
+
+## **Supply input data**
+
+This script imports a polygon of the land directly into R using the rnaturaleath package. This resolution is generally suitable, but if you want to use a different basemap (e.g. high resolution and/or a particular projection), go to appendix # and this script will give an example. 
+
+```{r swe3-input}
+## Colony data: location, abundance estimate
+df <- read.csv("colony_sizes.csv")
+head(df)
+
+#Remove the colonies already represented by tracking data
+df <- subset(df, colony_name != c("ColonyName1","ColonyName2"))
+
+## Maximum colony radius distance (m)
+#max_colony_radius <- 54000 #Sandwich Tern
+#max_colony_radius <- 17000 #European Shag 
+#max_colony_radius <- 1500 #Osprey
+#max_colony_radius <- 255900 #Audouin's Gull
+#max_colony_radius <- 140000 #Eleonora's Falcon
+max_colony_radius <- 300000 #European Storm-petrel
+
+## Raster
+#Read in study raster
+ras <- terra::rast("study_raster.tif")
+
+#Open eez layer and reproject
+eez <- read_sf("EEZ_land_union_v3_202003")
+
+it_eez <- subset(eez,UNION == "Italy")
+if(st_crs(it_eez) != st_crs(ras)){
+  it_eez <- st_transform(it_eez, crs = st_crs(ras))
+} else {
+  it_eez <- it_eez
+}
+
+
+```
+
+## **Format colony locations as spatial objects**
+
+If the colony locations are not projected into an equal areas crs with metres (m) as the unit, this will need to be done before calculating the distance. 
+
+```{r swe3-crs}
+#The script requires the spatial data to be projected into an equal areas projection with meters (m) as a unit
+ras
+
+#Set coordinate reference system (CRS) for colony locations (example for lat/lon, WGS84)
+col_locs <- st_as_sf(df,coords = c("longitude","latitude"), crs = 4326) 
+
+#Make sure colony data is projected to the basemap crs 
+col_locs_proj <- st_transform(col_locs, crs = st_crs(ras))
+```
+
+## **Calculate distance by sea from the colony per cell**
+
+- Calculate distances from the colony to each cell travelling only through marine cells, because the birds are expect to travel around land masses rather than over them to reach marine destinations.
+-   For each raster, the script will provide a note to say whether the calculation is successful and advice on what to do if it is not.
+
+
+```{r swe3-calc-dist}
+#Create a loop to apply the same method to each colony
+for(i in 1:nrow(df)){
+  
+  colony <- subset(col_locs_proj,colony_name == df$colony_name[i]);colony
+
+  ## Extract the cell location of the colony
+  pp <- terra::extract(ras,vect(colony), cells=TRUE) 
+
+  ## convert that cell to a value of 2
+  colony_ras <- ras
+  colony_ras[pp$cell] <- 2
+
+  ## You now have a raster with colony cell = 2, land cells = NA and sea cells = 1
+
+  ## Calculate distance from colony via sea, cell values of NA are avoided while determining distance
+  DistSea <- terra::gridDist(x=colony_ras,  # x specifies which raster to use
+                             target=2)      # specifies which cell to determine distance from distance
+  
+  #Add the minimum grid resolution
+  DistSea <- DistSea + res(ras)[1]
+  
+  #Add colony name to raster
+  names(DistSea) <- df$colony_name[i]
+
+  #Check calculation is successful
+  if(terra::minmax(DistSea)[2] == 0) print("WARNING: Check for NAs in final output. Your origin(colony) may be to far in land. 
+                                                  Therefore, your origin is completely buffered by omit cells (land cells), 
+                                                  and no distance calculation for cells at sea can be performed") else print(paste(i,
+                                         "Distance calculation successful"))
+
+
+  #Save rasters 
+  if(i == 1){
+      ColonyStack <- DistSea
+  } else {
+     ColonyStack <- c(ColonyStack,DistSea)
+  }
+}
+
+
+```
+## **Inspect the output distance from colony rasters**
+
+-   Look at the object and plot examples
+
+```{r swe3-plot-calc-dist, fig.show="hold", out.width="50%"}
+
+#Output is a stack of rasters containing a layer for each colony
+ColonyStack
+print(paste(nlyr(ColonyStack),"raster layers"))
+
+#Create colour ramps
+greens <- colorRampPalette(brewer.pal(n = 9, name = "Greens"))(100)[15:100]
+
+#To plot a particular raster use the index number
+
+#plot(ColonyStack[[1]], main = df$colony_name[1]) 
+
+#To plot a particular raster use the index number
+
+for(i in 1:nlyr(ColonyStack)){
+  plot(ColonyStack[[i]], main = df$colony_name[i], col = greens) 
+}
+
+
+```
+
+## **For each colony, estimate number of birds that use each cell**
+- Set any cells that are further that the provided maximum distance from the colony to NA
+- Normalise to 0 and 1 probability of occurrence instead of distance
+- Multiple by colony size
+- Save ouputs to another raster stack
+- Plot examples
+
+```{r swe3-dist-to-pop, fig.show="hold", out.width="50%"}
+
+#Loop through colonies
+for(i in 1:nrow(df)){
+
+  DistSea <- ColonyStack[[i]]
+  
+  ## Set any cell further than maximum distance to NA
+  DistSea[DistSea > max_colony_radius] <- NA
+
+  ## Normalise to 0 and 1 probability of occurrence
+  ProbOccurence <- -1*(DistSea/max_colony_radius)+1 
+
+  ## Set any cell that is 0 to NA
+  ProbOccurence[ProbOccurence == 0] <- NA
+  
+  #Apply logarithmic decay function as done in Critchley et al. 2020. 
+  #https://onlinelibrary.wiley.com/doi/full/10.1111/ecog.04653
+  #Skipping this step will result in a linear decay. Other decay functions could be input here if justified.
+  ProbOccurenceLog <- ProbOccurence*(1/log(DistSea))
+  
+  #Rescale to between 0 and 1
+  ProbOccurenceLog <- ProbOccurenceLog/
+    max(values(ProbOccurenceLog), na.rm =T)
+  
+  #Multiply by population size
+  PopRaster <- ProbOccurenceLog*df$colony_size[i]
+  
+  #Add colony name to raster
+  names(PopRaster) <- df$colony_name[i]
+  
+  #Save rasters 
+  if(i == 1){
+      ColonyStack_pop <- PopRaster
+  } else {
+     ColonyStack_pop <- c(ColonyStack_pop,PopRaster)
+  }
+}
+
+#To plot a particular raster use the index number
+for(i in 1:nlyr(ColonyStack_pop)){
+  plot(ColonyStack_pop[[i]], main = df$colony_name[i], col = greens) 
+}
+```
+## **Read in the tracking raster**
+
+```{r swe3-add-tracking}
+
+tracking_raster <- terra::rast("tracking_raster.tif")
+
+plot(tracking_raster, col = greens)
+
+tracking_raster
+ras
+
+```
+## **Overlap the rasters and raster outputs**
+
+```{r swe3-raster-ovelap}
+
+all_se_raster <- sum(ColonyStack_pop, na.rm = T)
+all_se_raster[is.na(all_se_raster)] <- 0
+plot(all_se_raster)
+
+all_sites_raster <- all_se_raster+tracking_raster
+
+plot(all_sites_raster)
+
+#create folders for maps to check results
+outputs <- "/seaward_extension_outputs"
+dir.create(paste0(wd,outputs))
+
+#save
+terra::writeRaster(all_sites_raster,paste0(wd,outputs,"/seaward-ext-multi-col-dist-tracks.tif"), overwrite=T)
+
+```
+
+
